@@ -1,0 +1,12 @@
+Name:          pure-stm
+Version:       0.1
+Description:   A pure Haskell implementation of STM
+Author:        Jonathan S
+Build-Type:    Simple
+Cabal-Version: >=1.2
+
+library
+    HS-Source-Dirs:  src
+    Build-Depends:   base, containers, threadlocal
+    Exposed-modules: Control.Monad.TM
+    ghc-options:     -Wall
