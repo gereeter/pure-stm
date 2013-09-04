@@ -5,7 +5,7 @@ module Control.Monad.TM (TM, TVar, atomically, newTVar, newTVarIO, readTVar, rea
 import qualified Data.Map as M
 import qualified Data.Set as S
 import Data.TLRef
-import Data.Maybe
+import Data.Maybe (fromJust, catMaybes)
 import Control.Exception
 import Control.Monad
 import Data.IORef
@@ -18,7 +18,7 @@ import Unsafe.Coerce
 -- Use thread-local counts to reduce contention
 {-# NOINLINE uniques #-}
 uniques :: TLRef Int
-uniques = unsafePerformIO newTLRef
+uniques = unsafePerformIO (newTLRef 0)
 
 type Timestamp = Int -- N.B. These are Lamport timestamps
 data TVarId = TVarId ThreadId Int deriving (Eq, Ord)
@@ -80,7 +80,7 @@ newTVar val = TM $ \_ _ _ cacheRef -> do
 
 newTVarIO :: a -> IO (TVar a)
 newTVarIO val = do
-    uniq <- fromMaybe 0 <$> readTLRef uniques
+    uniq <- readTLRef uniques
     writeTLRef uniques (uniq + 1)
     tid <- myThreadId
     let tvarId = TVarId tid uniq
