@@ -1,6 +1,6 @@
 {-# LANGUAGE ExistentialQuantification, DoAndIfThenElse #-}
 
-module Control.Monad.TM (TM, TVar, atomically, newTVar, newTVarIO, readTVar, readTVarIO, writeTVar, writeTVarIO, retry, orElse, unsafeIOToTM) where
+module Control.Monad.TM where
 
 import qualified Data.Map as M
 import qualified Data.Set as S
@@ -41,6 +41,7 @@ instance Ord ATVar where
 
 newtype TM a = TM {unTM ::
         IORef Timestamp -> -- the timestamp of the transaction
+        IORef (Maybe Timestamp) -> -- the timestamp bound
         IORef (S.Set ATVar) -> -- the write set
         IORef (M.Map ATVar Timestamp) -> -- the set of TVars that were current last time we checked
         IORef (M.Map ATVar Any) -> -- the read/write cache
@@ -48,19 +49,19 @@ newtype TM a = TM {unTM ::
     }
 
 instance Monad TM where
-    return x = TM $ \_ _ _ _ -> return (Just x)
-    TM mx >>= f = TM $ \curTimeRef writeSetRef curSetRef cacheRef -> do
-        x <- mx curTimeRef writeSetRef curSetRef cacheRef
+    return x = TM $ \_ _ _ _ _ -> return (Just x)
+    TM mx >>= f = TM $ \curTimeRef topTimeRef writeSetRef curSetRef cacheRef -> do
+        x <- mx curTimeRef topTimeRef writeSetRef curSetRef cacheRef
         case x of
             Nothing -> return Nothing
-            Just val -> unTM (f val) curTimeRef writeSetRef curSetRef cacheRef
+            Just val -> unTM (f val) curTimeRef topTimeRef writeSetRef curSetRef cacheRef
 
 instance MonadPlus TM where
-    mzero = TM $ \_ _ _ _ -> return Nothing
-    TM left `mplus` TM right = TM $ \curTimeRef writeSetRef curSetRef cacheRef -> do
-        leftRet <- left curTimeRef writeSetRef curSetRef cacheRef
+    mzero = TM $ \_ _ _ _ _ -> return Nothing
+    TM left `mplus` TM right = TM $ \curTimeRef topTimeRef writeSetRef curSetRef cacheRef -> do
+        leftRet <- left curTimeRef topTimeRef writeSetRef curSetRef cacheRef
         case leftRet of
-            Nothing -> right curTimeRef writeSetRef curSetRef cacheRef
+            Nothing -> right curTimeRef topTimeRef writeSetRef curSetRef cacheRef
             Just ret -> return (Just ret)
 
 retry :: TM a
@@ -70,10 +71,10 @@ orElse :: TM a -> TM a -> TM a
 orElse = mplus
 
 unsafeIOToTM :: IO a -> TM a
-unsafeIOToTM act = TM $ \_ _ _ _ -> Just <$> act
+unsafeIOToTM act = TM $ \_ _ _ _ _ -> Just <$> act
 
 newTVar :: a -> TM (TVar a)
-newTVar val = TM $ \_ _ _ cacheRef -> do
+newTVar val = TM $ \_ _ _ _ cacheRef -> do
     tvar <- newTVarIO val
     modifyIORef' cacheRef (M.insert (ATVar tvar) (unsafeCoerce val))
     return (Just tvar)
@@ -91,16 +92,24 @@ newTVarIO val = do
     return (TVar tvarId lock timeRef valRef waitLocksRef)
 
 readTVar :: TVar a -> TM a
-readTVar tvar@(TVar _ lock timeRef valRef _) = TM $ \curTimeRef _ curSetRef cacheRef -> do
+readTVar tvar@(TVar _ lock timeRef valRef _) = TM $ \curTimeRef topTimeRef _ curSetRef cacheRef -> do
     cache <- readIORef cacheRef
     if M.member (ATVar tvar) cache
     then return (Just $ unsafeCoerce $ cache M.! ATVar tvar)
     else do
         (time, val) <- withMVar lock $ \() -> (,) <$> readIORef timeRef <*> readIORef valRef -- TODO: do I really need the lock?
-        modifyIORef' curTimeRef (max time) -- should I check if I need to abort here?
         modifyIORef' curSetRef (M.insert (ATVar tvar) time)
         modifyIORef' cacheRef (M.insert (ATVar tvar) (unsafeCoerce val))
-        return (Just val)
+        curTime <- readIORef curTimeRef
+        success <- if time > curTime
+            then do
+                topTimeM <- readIORef topTimeRef
+                case topTimeM of
+                    Nothing -> writeIORef curTimeRef time >> return True
+                    Just topTime | topTime > curTime -> writeIORef curTimeRef time >> return True
+                                 | otherwise         -> return False
+            else return True
+        return (if success then Just val else Nothing)
 
 -- TODO: exception safety
 readTVarIO :: TVar a -> IO a
@@ -109,7 +118,7 @@ readTVarIO (TVar _ _ _ ref _) = readIORef ref
 writeTVar :: TVar a -> a -> TM ()
 writeTVar tvar val = do
     _ <- readTVar tvar
-    TM $ \_ writeSetRef _ cacheRef -> do
+    TM $ \_ _ writeSetRef _ cacheRef -> do
         modifyIORef' cacheRef (M.insert (ATVar tvar) (unsafeCoerce val))
         modifyIORef' writeSetRef (S.insert (ATVar tvar))
         return (Just ())
@@ -120,16 +129,37 @@ writeTVarIO (TVar _ lock timeRef valRef _) val = withMVar lock $ \() -> do
     modifyIORef' timeRef (+1)
     writeIORef valRef val
 
+validateTVar :: TVar a -> TM ()
+validateTVar tvar@(TVar _ _ timeRef _ _) = TM $ \curTimeRef topTimeRef _ curSetRef _ -> do
+    newTime <- readIORef timeRef
+    curSet <- readIORef curSetRef
+    case M.lookup (ATVar tvar) curSet of
+        Nothing -> return (Just ())
+        Just oldTime | oldTime == newTime -> return (Just ())
+                     | otherwise -> do
+                         writeIORef curSetRef (M.delete (ATVar tvar) curSet)
+                         curTime <- readIORef curTimeRef
+                         if curTime < newTime
+                         then do
+                            topTimeM <- readIORef topTimeRef
+                            case topTimeM of
+                                Nothing -> writeIORef topTimeRef (Just newTime)
+                                Just topTime -> writeIORef topTimeRef (Just (min topTime newTime))
+                            return (Just ())
+                         else return Nothing
+
 -- TODO: exception safety
 atomically :: TM a -> IO a
 atomically (TM act) = mask_ loop where
     loop = do
         curTimeRef <- newIORef 0
+        topTimeRef <- newIORef Nothing
         writeSetRef <- newIORef S.empty
         curSetRef <- newIORef M.empty
         cacheRef <- newIORef M.empty
-        maybeRet <- act curTimeRef writeSetRef curSetRef cacheRef
+        maybeRet <- act curTimeRef topTimeRef writeSetRef curSetRef cacheRef
         curTime <- readIORef curTimeRef
+        topTimeM <- readIORef topTimeRef
         writeSet <- readIORef writeSetRef
         curSet <- readIORef curSetRef
         cache <- readIORef cacheRef
@@ -159,9 +189,12 @@ atomically (TM act) = mask_ loop where
                         if time /= recTime
                         then return (Just time)
                         else return Nothing)
-                let readSuccess = if null times
-                    then True
-                    else all (< minimum times) (M.elems curSet)
+                let topTime = case topTimeM of
+                        Nothing -> if null times then Nothing else Just (minimum times)
+                        Just tt -> if null times then Just tt else Just (min tt (minimum times))
+                let readSuccess = case topTime of
+                        Nothing -> True
+                        Just tt -> curTime + 1 < tt
                 writeSuccess <- and <$>
                     (forM (S.toList writeSet) $
                     \atvar@(ATVar (TVar _ _ timeRef _ _)) -> do
@@ -184,7 +217,7 @@ atomically (TM act) = mask_ loop where
                 then return ret
                 else loop -- abort
 
-{-
+
 test1 :: IO ()
 test1 = do
     var1 <- atomically (newTVar 0) :: IO (TVar Int)
@@ -193,11 +226,11 @@ test1 = do
     mvar2 <- newEmptyMVar
     _ <- forkIO $ atomically (do 
         val <- readTVar var1
-        unsafeIOtoTM yield
+        unsafeIOToTM yield
         writeTVar var2 (val + 1)) >> putMVar mvar1 ()
     _ <- forkIO $ atomically (do 
         val <- readTVar var2
-        unsafeIOtoTM yield
+        unsafeIOToTM yield
         writeTVar var1 (val + 1)) >> putMVar mvar2 ()
     takeMVar mvar1
     takeMVar mvar2
@@ -205,9 +238,8 @@ test1 = do
     ret2 <- atomically (readTVar var2)
     if ((ret1 == 1 && ret2 == 2) || (ret1 == 2 && ret2 == 1))
     then return ()
-    else putStrLn "test1 failed"
-
--- Currently O(n^2) because of abort vs. retry
+    else putStrLn "test1 failed" >> print ret1 >> print ret2
+{-
 test2 :: Int -> IO ()
 test2 n = do
     locks <- replicateM n (atomically (newTVar Nothing))
@@ -226,7 +258,7 @@ test2 n = do
     if success
     then return ()
     else putStrLn "test2 failed"
-
+-}
 test3 :: IO ()
 test3 = do
     var <- atomically (newTVar 0) :: IO (TVar Int)
@@ -234,7 +266,7 @@ test3 = do
     mvar2 <- newEmptyMVar
     _ <- forkIO $ atomically (do 
         val <- readTVar var
-        unsafeIOtoTM $ threadDelay 1000000
+        unsafeIOToTM $ threadDelay 1000000
         writeTVar var (val + 1)) >> putMVar mvar1 ()
     _ <- forkIO $ threadDelay 500000 >> atomically (do
         val <- readTVar var
@@ -245,4 +277,3 @@ test3 = do
     if ret == 2
     then return ()
     else putStrLn "test3 failed"
--}
