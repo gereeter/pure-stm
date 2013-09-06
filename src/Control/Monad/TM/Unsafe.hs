@@ -1,4 +1,5 @@
 module Control.Monad.TM.Unsafe (
-    unsafeIOToTM
+      unsafeIOToTM
+    , unsafeUnreadTVar
 ) where
 import Control.Monad.TM.Internal

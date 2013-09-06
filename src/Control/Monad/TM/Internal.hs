@@ -1,6 +1,6 @@
 {-# LANGUAGE ExistentialQuantification, DoAndIfThenElse #-}
 
-module Control.Monad.TM where
+module Control.Monad.TM.Internal where
 
 import qualified Data.Map as M
 import qualified Data.Set as S
@@ -76,6 +76,19 @@ orElse = mplus
 unsafeIOToTM :: IO a -> TM a
 unsafeIOToTM act = TM $ \_ _ _ _ _ -> Good <$> act
 
+-- TODO: It feels like I need to grab a lock here.
+unsafeUnreadTVar :: TVar a -> TM ()
+unsafeUnreadTVar tvar = do
+    validateTVar tvar
+    TM $ \_ _ writeSetRef curSetRef cacheRef -> do
+        writeSet <- readIORef writeSetRef
+        if S.member (ATVar tvar) writeSet
+        then return (Good ())
+        else do
+            modifyIORef' curSetRef (M.delete (ATVar tvar))
+            modifyIORef' cacheRef (M.delete (ATVar tvar))
+            return (Good ())
+
 newTVar :: a -> TM (TVar a)
 newTVar val = TM $ \_ _ _ _ cacheRef -> do
     tvar <- newTVarIO val
@@ -142,7 +155,7 @@ validateTVar tvar@(TVar _ _ timeRef _ _) = TM $ \curTimeRef topTimeRef _ curSetR
                      | otherwise -> do
                          writeIORef curSetRef (M.delete (ATVar tvar) curSet)
                          curTime <- readIORef curTimeRef
-                         if curTime < newTime
+                         if curTime + 1 < newTime
                          then do
                             topTimeM <- readIORef topTimeRef
                             case topTimeM of
