@@ -111,23 +111,18 @@ newTVarIO val = do
 readTVar :: TVar a -> TM a
 readTVar tvar@(TVar _ lock timeRef valRef _) = TM $ \curTimeRef topTimeRef _ curSetRef cacheRef -> do
     cache <- readIORef cacheRef
-    if M.member (ATVar tvar) cache
-    then return (Good $ unsafeCoerce $ cache M.! ATVar tvar)
-    else do
-        (time, val) <- withMVar lock $ \() -> (,) <$> readIORef timeRef <*> readIORef valRef -- TODO: do I really need the lock?
-        modifyIORef' curSetRef (M.insert (ATVar tvar) time)
-        modifyIORef' cacheRef (M.insert (ATVar tvar) (unsafeCoerce val))
-        curTime <- readIORef curTimeRef
-        success <- if time > curTime
-            then do
-                topTimeM <- readIORef topTimeRef
-                case topTimeM of
-                    Nothing -> writeIORef curTimeRef time >> return True
-                    Just topTime | topTime > curTime -> writeIORef curTimeRef time >> return True
-                                 | otherwise         -> return False
-            else return True
-        return (if success then Good val else Abort)
-
+    case M.lookup (ATVar tvar) cache of
+        Just val -> return $ Good $ unsafeCoerce val
+        Nothing  -> do
+            (time, val) <- withMVar lock $ \() -> (,) <$> readIORef timeRef <*> readIORef valRef
+            modifyIORef' curSetRef (M.insert (ATVar tvar) time)
+            modifyIORef' cacheRef (M.insert (ATVar tvar) (unsafeCoerce val))
+            curTime <- readIORef curTimeRef
+            when (time > curTime) $ writeIORef curTimeRef time
+            topTimeM <- readIORef topTimeRef
+            let success = time <= curTime || maybe True (> curTime + 1) topTimeM
+            return (if success then Good val else Abort)
+    
 -- TODO: exception safety
 readTVarIO :: TVar a -> IO a
 readTVarIO (TVar _ _ _ ref _) = readIORef ref
@@ -158,10 +153,7 @@ validateTVar tvar@(TVar _ _ timeRef _ _) = TM $ \curTimeRef topTimeRef _ curSetR
                          curTime <- readIORef curTimeRef
                          if curTime + 1 < newTime
                          then do
-                            topTimeM <- readIORef topTimeRef
-                            case topTimeM of
-                                Nothing -> writeIORef topTimeRef (Just newTime)
-                                Just topTime -> writeIORef topTimeRef (Just (min topTime newTime))
+                            modifyIORef' topTimeRef (Just . maybe newTime (min newTime))
                             return (Good ())
                          else return Abort
 
@@ -200,19 +192,16 @@ atomically (TM act) = mask_ loop where
                 
                 forM_ (M.keys cache) $ \(ATVar (TVar _ lock _ _ _)) -> takeMVar lock
                 
-                times <- catMaybes <$>
-                    (forM (M.toList curSet) $
+                times <- (forM (M.toList curSet) $
                     \(ATVar (TVar _ _ timeRef _ _), recTime) -> do
                         time <- readIORef timeRef
                         if time /= recTime
                         then return (Just time)
                         else return Nothing)
-                let topTime = case topTimeM of
-                        Nothing -> if null times then Nothing else Just (minimum times)
-                        Just tt -> if null times then Just tt else Just (min tt (minimum times))
-                let readSuccess = case topTime of
-                        Nothing -> True
-                        Just tt -> curTime + 1 < tt
+                let prunedTimes = catMaybes (topTimeM : times)
+                let readSuccess = if null prunedTimes
+                                  then True
+                                  else curTime + 1 < minimum prunedTimes
                 writeSuccess <- and <$>
                     (forM (S.toList writeSet) $
                     \atvar@(ATVar (TVar _ _ timeRef _ _)) -> do
@@ -227,7 +216,7 @@ atomically (TM act) = mask_ loop where
                     waitLocks <- readIORef waitLocksRef
                     forM_ waitLocks $ \waitLock -> tryPutMVar waitLock ()
                     writeIORef waitLocksRef []
-                else putStrLn "abort" -- abort
+                else return () -- abort
                 
                 forM_ (M.keys cache) $ \(ATVar (TVar _ lock _ _ _)) -> putMVar lock ()
                 
