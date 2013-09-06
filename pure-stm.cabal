@@ -8,5 +8,5 @@ Cabal-Version: >=1.2
 library
     HS-Source-Dirs:  src
     Build-Depends:   base, containers, threadlocal
-    Exposed-modules: Control.Monad.TM
+    Exposed-modules: Control.Monad.TM, Control.Monad.TM.Unsafe, Control.Monad.TM.Internal
     ghc-options:     -Wall
