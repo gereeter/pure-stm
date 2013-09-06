@@ -77,17 +77,18 @@ unsafeIOToTM :: IO a -> TM a
 unsafeIOToTM act = TM $ \_ _ _ _ _ -> Good <$> act
 
 -- TODO: It feels like I need to grab a lock here.
+-- FIXME: This breaks retry - we want to detect if unread vars change
 unsafeUnreadTVar :: TVar a -> TM ()
 unsafeUnreadTVar tvar = do
     validateTVar tvar
     TM $ \_ _ writeSetRef curSetRef cacheRef -> do
         writeSet <- readIORef writeSetRef
-        if S.member (ATVar tvar) writeSet
-        then return (Good ())
-        else do
+        if S.null writeSet
+        then do
             modifyIORef' curSetRef (M.delete (ATVar tvar))
             modifyIORef' cacheRef (M.delete (ATVar tvar))
-            return (Good ())
+        else return ()
+        return (Good ())
 
 newTVar :: a -> TM (TVar a)
 newTVar val = TM $ \_ _ _ _ cacheRef -> do
