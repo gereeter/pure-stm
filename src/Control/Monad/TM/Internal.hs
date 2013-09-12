@@ -8,6 +8,8 @@ import Data.TLRef
 import Data.Maybe (fromJust, catMaybes)
 import Control.Exception
 import Control.Monad
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.State.Strict
 import Data.IORef
 import Control.Concurrent
 import Control.Applicative
@@ -41,31 +43,46 @@ instance Ord ATVar where
 
 data Result a = Abort | Retry | Good !a
 
-newtype TM a = TM {unTM ::
-        IORef Timestamp -> -- the timestamp of the transaction
-        IORef (Maybe Timestamp) -> -- the timestamp bound
-        IORef (S.Set ATVar) -> -- the write set
-        IORef (M.Map ATVar Timestamp) -> -- the set of TVars that were current last time we checked
-        IORef (M.Map ATVar Any) -> -- the read/write cache
-        IO (Result a)
-    }
+data TRec = TRec
+        { curTime  :: !Timestamp
+        , topTime  :: !(Maybe Timestamp)
+        , writeSet :: !(S.Set ATVar)
+        , curSet   :: !(M.Map ATVar Timestamp)
+        , cache    :: !(M.Map ATVar Any)}
+
+newtype TM a = TM {unTM :: StateT TRec IO (Result a)}
 
 instance Monad TM where
-    return x = TM $ \_ _ _ _ _ -> return (Good x)
-    TM mx >>= f = TM $ \curTimeRef topTimeRef writeSetRef curSetRef cacheRef -> do
-        x <- mx curTimeRef topTimeRef writeSetRef curSetRef cacheRef
+    return x = TM $ return (Good x)
+    TM mx >>= f = TM $ do
+        x <- mx
         case x of
-            Good val -> unTM (f val) curTimeRef topTimeRef writeSetRef curSetRef cacheRef
+            Good val -> unTM (f val)
             Abort    -> return Abort
             Retry    -> return Retry
 
 instance MonadPlus TM where
-    mzero = TM $ \_ _ _ _ _ -> return Retry
-    TM left `mplus` TM right = TM $ \curTimeRef topTimeRef writeSetRef curSetRef cacheRef -> do
-        leftRet <- left curTimeRef topTimeRef writeSetRef curSetRef cacheRef
+    mzero = TM $ return Retry
+    TM left `mplus` TM right = TM $ do
+        leftRet <- left
         case leftRet of
-            Retry -> right curTimeRef topTimeRef writeSetRef curSetRef cacheRef
+            Retry -> right
             _     -> return leftRet
+
+modifyCurTime :: (Timestamp -> Timestamp) -> StateT TRec IO ()
+modifyCurTime f = modify $ \rec -> rec {curTime = f (curTime rec)}
+
+modifyTopTime :: (Maybe Timestamp -> Maybe Timestamp) -> StateT TRec IO ()
+modifyTopTime f = modify $ \rec -> rec {topTime = f (topTime rec)}
+
+modifyWriteSet :: (S.Set ATVar -> S.Set ATVar) -> StateT TRec IO ()
+modifyWriteSet f = modify $ \rec -> rec {writeSet = f (writeSet rec)}
+
+modifyCurSet :: (M.Map ATVar Timestamp -> M.Map ATVar Timestamp) -> StateT TRec IO ()
+modifyCurSet f = modify $ \rec -> rec {curSet = f (curSet rec)}
+
+modifyCache :: (M.Map ATVar Any -> M.Map ATVar Any) -> StateT TRec IO ()
+modifyCache f = modify $ \rec -> rec {cache = f (cache rec)}
 
 retry :: TM a
 retry = mzero
@@ -74,26 +91,26 @@ orElse :: TM a -> TM a -> TM a
 orElse = mplus
 
 unsafeIOToTM :: IO a -> TM a
-unsafeIOToTM act = TM $ \_ _ _ _ _ -> Good <$> act
+unsafeIOToTM act = TM $ Good <$> lift act
 
 -- TODO: It feels like I need to grab a lock here.
 -- FIXME: This breaks retry - we want to detect if unread vars change
 unsafeUnreadTVar :: TVar a -> TM ()
 unsafeUnreadTVar tvar = do
     validateTVar tvar
-    TM $ \_ _ writeSetRef curSetRef cacheRef -> do
-        writeSet <- readIORef writeSetRef
-        if S.null writeSet
+    TM $ do
+        writeSet' <- writeSet <$> get
+        if S.null writeSet'
         then do
-            modifyIORef' curSetRef (M.delete (ATVar tvar))
-            modifyIORef' cacheRef (M.delete (ATVar tvar))
+            modifyCurSet (M.delete (ATVar tvar))
+            modifyCache (M.delete (ATVar tvar))
         else return ()
         return (Good ())
 
 newTVar :: a -> TM (TVar a)
-newTVar val = TM $ \_ _ _ _ cacheRef -> do
-    tvar <- newTVarIO val
-    modifyIORef' cacheRef (M.insert (ATVar tvar) (unsafeCoerce val))
+newTVar val = TM $ do
+    tvar <- lift (newTVarIO val)
+    modifyCache (M.insert (ATVar tvar) (unsafeCoerce val))
     return (Good tvar)
 
 newTVarIO :: a -> IO (TVar a)
@@ -109,18 +126,18 @@ newTVarIO val = do
     return (TVar tvarId lock timeRef valRef waitLocksRef)
 
 readTVar :: TVar a -> TM a
-readTVar tvar@(TVar _ lock timeRef valRef _) = TM $ \curTimeRef topTimeRef _ curSetRef cacheRef -> do
-    cache <- readIORef cacheRef
-    case M.lookup (ATVar tvar) cache of
+readTVar tvar@(TVar _ lock timeRef valRef _) = TM $ do
+    cache' <- cache <$> get
+    case M.lookup (ATVar tvar) cache' of
         Just val -> return $ Good $ unsafeCoerce val
         Nothing  -> do
-            (time, val) <- withMVar lock $ \() -> (,) <$> readIORef timeRef <*> readIORef valRef
-            modifyIORef' curSetRef (M.insert (ATVar tvar) time)
-            modifyIORef' cacheRef (M.insert (ATVar tvar) (unsafeCoerce val))
-            curTime <- readIORef curTimeRef
-            when (time > curTime) $ writeIORef curTimeRef time
-            topTimeM <- readIORef topTimeRef
-            let success = time <= curTime || maybe True (> curTime + 1) topTimeM
+            (time, val) <- lift $ withMVar lock $ \() -> (,) <$> readIORef timeRef <*> readIORef valRef
+            modifyCurSet (M.insert (ATVar tvar) time)
+            modifyCache (M.insert (ATVar tvar) (unsafeCoerce val))
+            curTime' <- curTime <$> get
+            when (time > curTime') $ modifyCurTime (const time)
+            topTimeM <- topTime <$> get
+            let success = time <= curTime' || maybe True (> curTime' + 1) topTimeM
             return (if success then Good val else Abort)
     
 -- TODO: exception safety
@@ -130,9 +147,9 @@ readTVarIO (TVar _ _ _ ref _) = readIORef ref
 writeTVar :: TVar a -> a -> TM ()
 writeTVar tvar val = do
     _ <- readTVar tvar
-    TM $ \_ _ writeSetRef _ cacheRef -> do
-        modifyIORef' cacheRef (M.insert (ATVar tvar) (unsafeCoerce val))
-        modifyIORef' writeSetRef (S.insert (ATVar tvar))
+    TM $ do
+        modifyCache (M.insert (ATVar tvar) (unsafeCoerce val))
+        modifyWriteSet (S.insert (ATVar tvar))
         return (Good ())
 
 -- TODO: exception safety
@@ -142,18 +159,18 @@ writeTVarIO (TVar _ lock timeRef valRef _) val = withMVar lock $ \() -> do
     writeIORef valRef val
 
 validateTVar :: TVar a -> TM ()
-validateTVar tvar@(TVar _ _ timeRef _ _) = TM $ \curTimeRef topTimeRef _ curSetRef _ -> do
-    newTime <- readIORef timeRef
-    curSet <- readIORef curSetRef
-    case M.lookup (ATVar tvar) curSet of
+validateTVar tvar@(TVar _ _ timeRef _ _) = TM $ do
+    newTime <- lift $ readIORef timeRef
+    curSet' <- curSet <$> get
+    case M.lookup (ATVar tvar) curSet' of
         Nothing -> return (Good ())
         Just oldTime | oldTime == newTime -> return (Good ())
                      | otherwise -> do
-                         writeIORef curSetRef (M.delete (ATVar tvar) curSet)
-                         curTime <- readIORef curTimeRef
-                         if curTime + 1 < newTime
+                         modifyCurSet (M.delete (ATVar tvar))
+                         curTime' <- curTime <$> get
+                         if curTime' + 1 < newTime
                          then do
-                            modifyIORef' topTimeRef (Just . maybe newTime (min newTime))
+                            modifyTopTime (Just . maybe newTime (min newTime))
                             return (Good ())
                          else return Abort
 
@@ -161,27 +178,18 @@ validateTVar tvar@(TVar _ _ timeRef _ _) = TM $ \curTimeRef topTimeRef _ curSetR
 atomically :: TM a -> IO a
 atomically (TM act) = mask_ loop where
     loop = do
-        curTimeRef <- newIORef 0
-        topTimeRef <- newIORef Nothing
-        writeSetRef <- newIORef S.empty
-        curSetRef <- newIORef M.empty
-        cacheRef <- newIORef M.empty
-        maybeRet <- act curTimeRef topTimeRef writeSetRef curSetRef cacheRef
-        curTime <- readIORef curTimeRef
-        topTimeM <- readIORef topTimeRef
-        writeSet <- readIORef writeSetRef
-        curSet <- readIORef curSetRef
-        cache <- readIORef cacheRef
+        let rec = TRec 0 Nothing S.empty M.empty M.empty
+        (maybeRet, rec') <- runStateT act rec
         case maybeRet of
             Abort -> loop
             Retry -> do
                 waitLock <- newEmptyMVar
                 immediateAbort <- or <$>
-                    (forM (M.keys cache) $
+                    (forM (M.keys (cache rec')) $
                     \atvar@(ATVar (TVar _ lock timeRef _ waitLocksRef)) ->
                     withMVar lock $ \() -> do
                         time <- readIORef timeRef
-                        if time == curSet M.! atvar
+                        if time == curSet rec' M.! atvar
                         then modifyIORef waitLocksRef (waitLock :) >> return False
                         else return True
                     )
@@ -190,35 +198,35 @@ atomically (TM act) = mask_ loop where
                 else takeMVar waitLock >> loop
             Good ret -> do
                 
-                forM_ (M.keys cache) $ \(ATVar (TVar _ lock _ _ _)) -> takeMVar lock
+                forM_ (M.keys (cache rec')) $ \(ATVar (TVar _ lock _ _ _)) -> takeMVar lock
                 
-                times <- (forM (M.toList curSet) $
+                times <- (forM (M.toList (curSet rec')) $
                     \(ATVar (TVar _ _ timeRef _ _), recTime) -> do
                         time <- readIORef timeRef
                         if time /= recTime
                         then return (Just time)
                         else return Nothing)
-                let prunedTimes = catMaybes (topTimeM : times)
+                let prunedTimes = catMaybes (topTime rec' : times)
                 let readSuccess = if null prunedTimes
                                   then True
-                                  else curTime + 1 < minimum prunedTimes
+                                  else curTime rec' + 1 < minimum prunedTimes
                 writeSuccess <- and <$>
-                    (forM (S.toList writeSet) $
+                    (forM (S.toList (writeSet rec')) $
                     \atvar@(ATVar (TVar _ _ timeRef _ _)) -> do
                         time <- readIORef timeRef
-                        return (time == curSet M.! atvar))
+                        return (time == curSet rec' M.! atvar))
                 let success = readSuccess && writeSuccess
                 if success
-                then forM_ (S.toList writeSet) $ \atvar@(ATVar (TVar _ _ timeRef valRef waitLocksRef)) -> do
-                    let val = fromJust $ M.lookup atvar cache
-                    writeIORef timeRef (curTime + 1)
+                then forM_ (S.toList (writeSet rec')) $ \atvar@(ATVar (TVar _ _ timeRef valRef waitLocksRef)) -> do
+                    let val = fromJust $ M.lookup atvar (cache rec')
+                    writeIORef timeRef (curTime rec' + 1)
                     writeIORef valRef (unsafeCoerce val)
                     waitLocks <- readIORef waitLocksRef
                     forM_ waitLocks $ \waitLock -> tryPutMVar waitLock ()
                     writeIORef waitLocksRef []
                 else return () -- abort
                 
-                forM_ (M.keys cache) $ \(ATVar (TVar _ lock _ _ _)) -> putMVar lock ()
+                forM_ (M.keys (cache rec')) $ \(ATVar (TVar _ lock _ _ _)) -> putMVar lock ()
                 
                 if success
                 then return ret
