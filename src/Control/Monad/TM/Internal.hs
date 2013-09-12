@@ -1,4 +1,4 @@
-{-# LANGUAGE ExistentialQuantification, DoAndIfThenElse #-}
+{-# LANGUAGE ExistentialQuantification, DoAndIfThenElse, NoMonoLocalBinds #-}
 
 module Control.Monad.TM.Internal where
 
@@ -139,8 +139,7 @@ readTVar tvar@(TVar _ lock timeRef valRef _) = TM $ do
             topTimeM <- topTime <$> get
             let success = time <= curTime' || maybe True (> curTime' + 1) topTimeM
             return (if success then Good val else Abort)
-    
--- TODO: exception safety
+
 readTVarIO :: TVar a -> IO a
 readTVarIO (TVar _ _ _ ref _) = readIORef ref
 
@@ -174,14 +173,13 @@ validateTVar tvar@(TVar _ _ timeRef _ _) = TM $ do
                             return (Good ())
                          else return Abort
 
--- TODO: exception safety
 atomically :: TM a -> IO a
-atomically (TM act) = mask_ loop where
-    loop = do
+atomically (TM act) = mask $ \restore -> loop restore where
+    loop restore = do
         let rec = TRec 0 Nothing S.empty M.empty M.empty
-        (maybeRet, rec') <- runStateT act rec
+        (maybeRet, rec') <- restore $ runStateT act rec
         case maybeRet of
-            Abort -> loop
+            Abort -> loop restore
             Retry -> do
                 waitLock <- newEmptyMVar
                 immediateAbort <- or <$>
@@ -194,8 +192,8 @@ atomically (TM act) = mask_ loop where
                         else return True
                     )
                 if immediateAbort
-                then loop
-                else takeMVar waitLock >> loop
+                then loop restore
+                else takeMVar waitLock >> loop restore
             Good ret -> do
                 
                 forM_ (M.keys (cache rec')) $ \(ATVar (TVar _ lock _ _ _)) -> takeMVar lock
@@ -230,4 +228,4 @@ atomically (TM act) = mask_ loop where
                 
                 if success
                 then return ret
-                else loop -- abort
+                else loop restore -- abort
